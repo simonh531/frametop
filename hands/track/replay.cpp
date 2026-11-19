@@ -54,7 +54,8 @@
 //             and residual, the bone-length calibration, bone-length spread, jitter, fingertip
 //             lag and the elbow, each for the measured, One Euro filtered and fitted landmarks.
 // --skel NAME=VALUE: a skeleton setting (skel::Params: pos_min, pos_beta, rot_min, rot_beta,
-//             ang_min, ang_beta, d_cutoff, glitch, depth_ratio, limits, iterations), repeatable.
+//             ang_min, ang_beta, d_cutoff, glitch, depth_ratio, limits, iterations, coast,
+//             coast_rms, coast_jump, coast_rot, coast_tau, coast_max, relax_tau, relock_frames), repeatable.
 // --labels FILE: frame-hands' auto-labels (labels.jsonl) for this recording: the landmarks'
 //             distance to them, measured, One Euro and fitted.
 // --hmd-poses FILE: a hand-recorder take's poses.jsonl: the arm model's elbow with gravity's up
@@ -99,6 +100,9 @@
 //             cameras, triangulation residual, hand scale, measured and published palm, and
 //             each view's one-view palm (Tracker::single_view at the hand's scale). The
 //             header has each camera's centre and focal length.
+// --diag FILE: per processed set, one JSONL line with tracker events and per-hand geometry,
+//             triangulation residuals, skeleton fit residuals, bone lengths, velocities,
+//             handedness scores, and per-view crops for offline failure/freak-out analysis.
 #include "flagbuf.h"
 #include "io.h"
 #include "pinch.h"
@@ -169,7 +173,7 @@ int main(int argc, char **argv) {
     PinchParams pinch_params;
     GripParams grip_params;
     std::string use = "mono", color_left = "color_video0", color_crop = "subtract", sides = "file";
-    std::string ray_out, tips_out;
+    std::string ray_out, tips_out, diag_out;
     double fixed_rate = 0, want_hz = 0;
     double flag_every = 0;
     std::vector<double> flag_at;
@@ -192,6 +196,7 @@ int main(int argc, char **argv) {
         else if (a == "--poses" && more) poses = argv[++i];
         else if (a == "--ray" && more) ray_out = argv[++i];
         else if (a == "--tips" && more) tips_out = argv[++i];
+        else if (a == "--diag" && more) diag_out = argv[++i];
         else if (a == "--rate" && more) fixed_rate = std::atof(argv[++i]);
         else if (a == "--want-hz" && more) want_hz = std::min(30.0, std::atof(argv[++i]));
         else if (a == "--threads" && more) threads = std::atoi(argv[++i]);
@@ -227,8 +232,16 @@ int main(int argc, char **argv) {
                       : k == "d_cutoff" ? &skel_params.d_cutoff : k == "limits" ? &skel_params.limits
                       : k == "depth_ratio" ? &skel_params.depth_ratio
                       : k == "glitch" ? &skel_params.glitch
-                      : k == "warm" ? &skel_params.warm : nullptr;
+                      : k == "warm" ? &skel_params.warm
+                      : k == "coast" ? &skel_params.coast
+                      : k == "coast_rms" ? &skel_params.coast_rms
+                      : k == "coast_jump" ? &skel_params.coast_jump
+                      : k == "coast_rot" ? &skel_params.coast_rot
+                      : k == "coast_tau" ? &skel_params.coast_tau
+                      : k == "coast_max" ? &skel_params.coast_max
+                      : k == "relax_tau" ? &skel_params.relax_tau : nullptr;
             if (k == "iterations") skel_params.iterations = int(v);
+            else if (k == "relock_frames") skel_params.relock_frames = int(v);
             else if (f && v == v) *f = v;
             else return std::fprintf(stderr, "--skel NAME=VALUE: %s?\n", kv.c_str()), 1;
         }
@@ -275,6 +288,7 @@ int main(int argc, char **argv) {
         return std::fprintf(stderr, "%s\n", err.c_str()), 1;
     nets.set_contrast(palm_contrast, hand_contrast);
     FILE *tl = timeline.empty() ? nullptr : std::fopen(timeline.c_str(), "w");
+    FILE *diagf = diag_out.empty() ? nullptr : std::fopen(diag_out.c_str(), "w");
 
     std::vector<fh_set_cam_t> cams;
     std::vector<std::vector<uint8_t>> px;
@@ -337,10 +351,9 @@ int main(int argc, char **argv) {
     tracker.set_hold(hold);
     tracker.set_search_budget(3, search_budget1);
     std::vector<std::string> trace;
-    if (tl) {
-        tracker.set_trace(&trace);
+    if (tl || diagf) tracker.set_trace(&trace);
+    if (tl)
         for (const std::string &line : tracker.describe_tiles()) std::fprintf(tl, "# %s\n", line.c_str());
-    }
     tracker.set_skeleton(skeleton);
     tracker.skeleton().set_params(skel_params);
     skeval::Eval eval;
@@ -506,6 +519,7 @@ int main(int argc, char **argv) {
             busy_ms += ms;
             busy_until = t + uint64_t(ms * slow * 1e6) + 3'000'000;   // + the ring hand-off
             const std::vector<Seen> seen = tracker.views_now();
+            const std::vector<std::string> step_trace = diagf ? trace : std::vector<std::string>{};
             if (tl)
                 for (const std::string &e : trace) std::fprintf(tl, "%.3f ev %s\n", ts, e.c_str());
             trace.clear();
@@ -676,6 +690,101 @@ int main(int argc, char **argv) {
                 for (auto &c : cams)
                     if (used.count(c.name) && std::string(c.name).rfind("color_", 0) != 0) dq = std::min(dq, int64_t(c.dqbuf_ns));
                 std::fwrite(&dq, sizeof dq, 1, pubf);
+            }
+            if (diagf) {
+                auto jnum = [](FILE *f, double v, const char *fmt = "%.5f") {
+                    if (std::isfinite(v)) std::fprintf(f, fmt, v);
+                    else std::fputs("null", f);
+                };
+                auto jv3 = [&](FILE *f, V3 v) {
+                    std::fputc('[', f);
+                    jnum(f, v[0]); std::fputc(',', f); jnum(f, v[1]); std::fputc(',', f); jnum(f, v[2]);
+                    std::fputc(']', f);
+                };
+                int64_t dq = INT64_MAX;
+                for (auto &c : cams)
+                    if (used.count(c.name) && std::string(c.name).rfind("color_", 0) != 0) dq = std::min(dq, int64_t(c.dqbuf_ns));
+                std::fprintf(diagf, "{\"set\":%d,\"ts\":%.4f,\"t_ns\":%llu,\"dq_ns\":%lld,\"events\":[",
+                             index, ts, (unsigned long long)t, (long long)(dq == INT64_MAX ? 0 : dq));
+                for (size_t i = 0; i < step_trace.size(); ++i) {
+                    if (i) std::fputc(',', diagf);
+                    std::fputs(json_string(step_trace[i]).c_str(), diagf);
+                }
+                std::fputs("],\"hands\":[", diagf);
+                auto palm = [](const V3 *p) { return (p[0] + p[5] + p[9] + p[13] + p[17]) * 0.2; };
+                for (size_t hi = 0; hi < out.size(); ++hi) {
+                    const Hand *h = out[hi];
+                    if (hi) std::fputc(',', diagf);
+                    const int sd = h->right() ? 1 : 0;
+                    const bool pdown = (pinch.side(sd).flags & FH_PINCH_DOWN) && pinch.side(sd).hand_id == uint32_t(h->id);
+                    const bool gdown = (grip.side(sd).flags & FH_PINCH_DOWN) && grip.side(sd).hand_id == uint32_t(h->id);
+                    double res_max = -1;
+                    if (h->nviews >= 2)
+                        for (int k = 0; k < 21; ++k) res_max = std::max(res_max, h->res_pt[k]);
+                    const V3 *p = h->fit.valid ? h->fit.pts : h->smooth;
+                    V3 nrm = cross3(p[5] - p[0], p[17] - p[0]);
+                    nrm = norm(nrm) > 0 ? nrm * ((h->right() ? 1.0 : -1.0) / norm(nrm)) : V3{0, 0, 0};
+                    std::fprintf(diagf, "{\"id\":%d,\"side\":\"%s\",\"right_score\":%.4f,\"side_evidence\":%.4f,\"nviews\":%d,\"scale\":%.4f,\"residual\":",
+                                 h->id, sd ? "R" : "L", h->right_score, h->side_evidence, h->nviews, h->scale);
+                    if (h->residual >= 0) jnum(diagf, h->residual); else std::fputs("null", diagf);
+                    std::fputs(",\"res_max\":", diagf);
+                    if (res_max >= 0) jnum(diagf, res_max); else std::fputs("null", diagf);
+                    std::fputs(",\"palm_raw\":", diagf); jv3(diagf, palm(h->pts));
+                    std::fputs(",\"palm_smooth\":", diagf); jv3(diagf, palm(h->smooth));
+                    std::fputs(",\"palm_fit\":", diagf); jv3(diagf, h->fit.valid ? palm(h->fit.pts) : palm(h->smooth));
+                    std::fputs(",\"palm_normal\":", diagf); jv3(diagf, nrm);
+                    std::fputs(",\"tips_raw\":[", diagf);
+                    const int tips[5] = {4, 8, 12, 16, 20};
+                    for (int ti = 0; ti < 5; ++ti) { if (ti) std::fputc(',', diagf); jv3(diagf, h->pts[tips[ti]]); }
+                    std::fputs("],\"tips_fit\":[", diagf);
+                    const V3 *fsrc = h->fit.valid ? h->fit.pts : h->smooth;
+                    for (int ti = 0; ti < 5; ++ti) { if (ti) std::fputc(',', diagf); jv3(diagf, fsrc[tips[ti]]); }
+                    std::fputs("],\"bone_len\":[", diagf);
+                    for (int b = 0; b < 20; ++b) {
+                        if (b) std::fputc(',', diagf);
+                        jnum(diagf, norm(h->pts[skeval::kBones[b][1]] - h->pts[skeval::kBones[b][0]]));
+                    }
+                    std::fputs("],\"bone_ref\":", diagf);
+                    if (h->fit.valid) {
+                        std::fputc('[', diagf);
+                        for (int b = 0; b < 20; ++b) { if (b) std::fputc(',', diagf); jnum(diagf, h->fit.len[b]); }
+                        std::fputc(']', diagf);
+                    } else {
+                        std::fputs("null", diagf);
+                    }
+                    std::fprintf(diagf, ",\"fit_ok\":%s,\"fit_rms\":", h->fit.valid ? "true" : "false");
+                    if (h->fit.valid) jnum(diagf, h->fit.rms); else std::fputs("null", diagf);
+                    std::fputs(",\"fit_chain_rms\":", diagf);
+                    if (h->fit.valid) {
+                        std::fputc('[', diagf);
+                        for (int c = 0; c < 5; ++c) { if (c) std::fputc(',', diagf); jnum(diagf, h->fit.chain_rms[c]); }
+                        std::fputc(']', diagf);
+                    } else {
+                        std::fputs("null", diagf);
+                    }
+                    std::fprintf(diagf, ",\"fit_flipped\":%s,\"coasting\":%s,\"fit_vel\":",
+                                 h->fit.flipped ? "true" : "false", h->fit.coasting ? "true" : "false");
+                    jv3(diagf, h->fit.vel);
+                    std::fputs(",\"fit_angvel\":", diagf);
+                    jv3(diagf, h->fit.angvel);
+                    std::fprintf(diagf, ",\"pinch_down\":%s,\"grip_down\":%s,\"pinch_d\":", pdown ? "true" : "false", gdown ? "true" : "false");
+                    if (pinch.world_d[sd] >= 0) jnum(diagf, pinch.world_d[sd], "%.4f"); else std::fputs("null", diagf);
+                    std::fputs(",\"pinch_tri_d\":", diagf);
+                    if (pinch.tri_d[sd] >= 0) jnum(diagf, pinch.tri_d[sd], "%.4f"); else std::fputs("null", diagf);
+                    std::fputs(",\"views\":[", diagf);
+                    bool first_v = true;
+                    for (const Seen &v : seen) {
+                        if (v.hand != h->id) continue;
+                        if (!first_v) std::fputc(',', diagf);
+                        first_v = false;
+                        const V2 puv = (v.lm.pts[0] + v.lm.pts[5] + v.lm.pts[9] + v.lm.pts[13] + v.lm.pts[17]) * 0.2;
+                        std::fprintf(diagf, "{\"cam\":%s,\"presence\":%.4f,\"right\":%.4f,\"roi\":[%.1f,%.1f,%.1f,%.4f],\"palm_uv\":[%.1f,%.1f]}",
+                                     json_string(v.cam).c_str(), v.lm.presence, v.lm.right,
+                                     v.roi.center[0], v.roi.center[1], v.roi.size, v.roi.rotation, puv[0], puv[1]);
+                    }
+                    std::fputs("]}", diagf);
+                }
+                std::fputs("]}\n", diagf);
             }
             ++processed;
             last_out = out;
@@ -893,5 +1002,6 @@ int main(int argc, char **argv) {
                     fs.crops, fs.ghosts, fs.crop_calls ? fs.crop_us / fs.crop_calls : 0.0, fs.dropped,
                     fs.last_error.empty() ? "" : "; error: ", fs.last_error.c_str());
     }
+    if (diagf) std::fclose(diagf);
     return 0;
 }

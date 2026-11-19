@@ -101,6 +101,17 @@ Rot axis_rot(int axis, double a) {
 const int kPalmIds[6] = {0, 1, 5, 9, 13, 17};
 const int kChainBase[5] = {1, 5, 9, 13, 17};
 const int kChainQ[5] = {0, 6, 11, 16, 21};   // first angle in Fit::q
+constexpr int kBones[20][2] = {{0, 1},   {1, 2},   {2, 3},   {3, 4},   {0, 5},   {5, 6},   {6, 7},
+                               {7, 8},   {0, 9},   {9, 10},  {10, 11}, {11, 12}, {0, 13}, {13, 14},
+                               {14, 15}, {15, 16}, {0, 17},  {17, 18}, {18, 19}, {19, 20}};
+// Relaxed neutral finger pose (rad) that low-trust / coasting fingers gently relax toward.
+constexpr double kNeutralQ[kAngles] = {
+    0, 0, 0, 0, 0.17, 0.17,          // thumb: slight MCP/IP curve
+    0, 0.26, 0, 0.35, 0.17,          // index
+    0, 0.26, 0, 0.35, 0.17,          // middle
+    0, 0.26, 0, 0.35, 0.17,          // ring
+    0, 0.26, 0, 0.35, 0.17,          // little
+};
 
 struct Dof {
     int joint;   // 0, 1, 2 along the chain
@@ -694,27 +705,103 @@ void Skeleton::update(Fit &f, const V3 pts[21], bool right, double right_score, 
         f.Rf = R, f.cf = c, f.vel = f.angvel = {0, 0, 0};
         std::copy(q, q + kParams, f.qf);
         std::fill(f.dq, f.dq + kParams, 0.0);
+        f.coasting = f.coast_expired = false;
+        f.coast_s = 0, f.relock_n = 0, f.tracked_ns = t_ns;
     } else {
-        auto alpha = [dt](double cutoff) { return 1 / (1 + 1 / (2 * M_PI * cutoff * dt)); };
-        const double ad = alpha(p_.d_cutoff);
-        f.vel = f.vel + ((c - f.cf) * (1 / dt) - f.vel) * ad;
-        f.cf = f.cf + (c - f.cf) * alpha(p_.pos_min + p_.pos_beta * norm(f.vel));
-        const V3 delta = log_rot(f.Rf.t() * R);   // in the filtered palm's frame
-        f.angvel = f.angvel + (f.Rf * delta * (1 / dt) - f.angvel) * ad;
-        f.Rf = f.Rf * exp_rot(delta * alpha(p_.rot_min + p_.rot_beta * norm(f.angvel)));
-        for (int ch = 0; ch < 5; ++ch) {
-            const int a = kChainQ[ch], b = ch + 1 < 5 ? kChainQ[ch + 1] : kAngles;
-            // a chain that fits its landmarks badly this frame is mostly a misplaced landmark (a
-            // finger hidden behind another): it moves the filter, and its speed, less
-            const double trust = std::min(1.0, std::pow(p_.glitch / std::max(crms[ch], 1e-6), 2));
-            double speed = 0;
-            for (int d = a; d < b; ++d) {
-                f.dq[d] += trust * ad * ((q[d] - f.qf[d]) / dt - f.dq[d]);
-                speed = std::max(speed, std::fabs(f.dq[d]));
+        bool do_coast = false;
+        bool relocked = false;
+        if (p_.coast > 0) {
+            bool bone_explode = false;
+            int bad_bones = 0;
+            for (int b = 0; b < 20; ++b) {
+                if (s.len[b] <= 1e-4) continue;
+                const double ratio = norm(pts[kBones[b][1]] - pts[kBones[b][0]]) / s.len[b];
+                if (ratio > 3.5) {
+                    bone_explode = true;
+                    break;
+                }
+                if (ratio > 3.0 || ratio < 0.2) ++bad_bones;
             }
-            const double ac = trust * alpha(p_.ang_min + p_.ang_beta * speed);
-            for (int d = a; d < b; ++d) f.qf[d] += ac * (q[d] - f.qf[d]);
-            for (int d = kAngles + 3 * ch; d < kAngles + 3 * ch + 3; ++d) f.qf[d] += ac * (q[d] - f.qf[d]);   // its base
+            bone_explode = bone_explode || bad_bones >= 2;
+            const bool geom_bad = rms > p_.coast_rms || bone_explode;
+            const double jump_m = norm(c - f.cf);
+            const double rot_rad = norm(log_rot(f.Rf.t() * R));
+            const bool kin_bad = jump_m > p_.coast_jump || rot_rad > p_.coast_rot;
+            if (geom_bad) {
+                do_coast = true;
+                f.relock_n = 0;
+            } else if (kin_bad) {
+                if (f.relock_n > 0 && norm(c - f.relock_c) < 0.08 && norm(log_rot(f.relock_R.t() * R)) < 0.7)
+                    ++f.relock_n;
+                else
+                    f.relock_n = 1;
+                f.relock_c = c, f.relock_R = R;
+                if (f.relock_n >= std::max(1, p_.relock_frames)) {
+                    relocked = true;
+                    f.relock_n = 0;
+                } else {
+                    do_coast = true;
+                }
+            }
+        }
+        if (do_coast) {
+            f.coasting = true;
+            f.coast_s += dt;
+            f.coast_expired = p_.coast_max > 0 && f.coast_s > p_.coast_max;
+            const double decay = p_.coast_tau > 1e-4 ? std::exp(-dt / p_.coast_tau) : 0.0;
+            const double eff_dt = p_.coast_tau > 1e-4 ? p_.coast_tau * (1.0 - decay) : 0.0;
+            f.cf = f.cf + f.vel * eff_dt;
+            f.vel = f.vel * decay;
+            // orientation stays frozen (tau_rot = 0)
+            f.angvel = {0, 0, 0};
+            // fingers relax gently toward neutral rest pose
+            const double ra = p_.relax_tau > 1e-4 ? (1.0 - std::exp(-dt / p_.relax_tau)) : 0.0;
+            for (int d = 0; d < kAngles; ++d) f.qf[d] += ra * (kNeutralQ[d] - f.qf[d]);
+            for (int d = kAngles; d < kParams; ++d) f.qf[d] *= (1.0 - ra);
+            for (int d = 0; d < kParams; ++d) f.dq[d] *= decay;
+        } else {
+            f.coasting = false;
+            f.coast_expired = false;
+            f.coast_s = 0;
+            f.relock_n = 0;
+            f.tracked_ns = t_ns;
+            auto alpha = [dt](double cutoff) { return 1 / (1 + 1 / (2 * M_PI * cutoff * dt)); };
+            const double ad = alpha(p_.d_cutoff);
+            const V3 delta = log_rot(f.Rf.t() * R);   // in the filtered palm's frame
+            if (relocked) {
+                // Blend smoothly into the newly confirmed clean pose without velocity overshoot.
+                f.vel = {0, 0, 0};
+                f.angvel = {0, 0, 0};
+                f.cf = f.cf + (c - f.cf) * alpha(p_.pos_min * 3.0);
+                f.Rf = f.Rf * exp_rot(delta * alpha(p_.rot_min * 3.0));
+            } else {
+                f.vel = f.vel + ((c - f.cf) * (1 / dt) - f.vel) * ad;
+                f.cf = f.cf + (c - f.cf) * alpha(p_.pos_min + p_.pos_beta * norm(f.vel));
+                f.angvel = f.angvel + (f.Rf * delta * (1 / dt) - f.angvel) * ad;
+                f.Rf = f.Rf * exp_rot(delta * alpha(p_.rot_min + p_.rot_beta * norm(f.angvel)));
+            }
+            const double ra = p_.coast > 0 && p_.relax_tau > 1e-4 ? (1.0 - std::exp(-dt / p_.relax_tau)) : 0.0;
+            for (int ch = 0; ch < 5; ++ch) {
+                const int a = kChainQ[ch], b = ch + 1 < 5 ? kChainQ[ch + 1] : kAngles;
+                // a chain that fits its landmarks badly this frame is mostly a misplaced landmark (a
+                // finger hidden behind another): it moves the filter, and its speed, less
+                const double trust = std::min(1.0, std::pow(p_.glitch / std::max(crms[ch], 1e-6), 2));
+                double speed = 0;
+                for (int d = a; d < b; ++d) {
+                    f.dq[d] += trust * ad * ((q[d] - f.qf[d]) / dt - f.dq[d]);
+                    speed = std::max(speed, std::fabs(f.dq[d]));
+                }
+                const double ac = trust * alpha(p_.ang_min + p_.ang_beta * speed);
+                for (int d = a; d < b; ++d) f.qf[d] += ac * (q[d] - f.qf[d]);
+                for (int d = kAngles + 3 * ch; d < kAngles + 3 * ch + 3; ++d) f.qf[d] += ac * (q[d] - f.qf[d]);   // its base
+                // When an individual finger is occluded/untrusted, gently relax it toward neutral
+                // while high-trust fingers keep tracking live.
+                if (ra > 0 && trust < 0.25) {
+                    const double w = ra * (1.0 - trust / 0.25);
+                    for (int d = a; d < b; ++d) f.qf[d] += w * (kNeutralQ[d] - f.qf[d]);
+                    for (int d = kAngles + 3 * ch; d < kAngles + 3 * ch + 3; ++d) f.qf[d] *= (1.0 - w);
+                }
+            }
         }
     }
     std::copy(crms, crms + 5, f.chain_rms);

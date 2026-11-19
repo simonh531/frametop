@@ -243,6 +243,25 @@ bool Tracker::hand_3d(Hand &hand, std::vector<View *> views, int64_t t_ns) {
     views.erase(std::remove_if(views.begin(), views.end(), [](View *v) { return !v->has_lm || !v->fresh; }), views.end());
     if (views.empty()) return false;
     if (views.size() >= 2) {
+        if (skel_.params().coast > 0) {
+            double rmin = 1.0, rmax = 0.0;
+            for (View *v : views) rmin = std::min(rmin, v->lm.right), rmax = std::max(rmax, v->lm.right);
+            if (rmax - rmin > 0.35) {
+                const double ref_r = hand.frames >= 3 ? hand.right_score : 0.5;
+                View *best = views[0];
+                auto score = [&](const View *v) {
+                    const double agree = hand.frames >= 3 ? -std::fabs(v->lm.right - ref_r) : 0.0;
+                    return agree * 2.0 + v->lm.presence;
+                };
+                for (View *v : views)
+                    if (score(v) > score(best)) best = v;
+                for (View *v : views)
+                    if (v != best) v->hand = -2;
+                ++stats.splits;
+                note("side-split %d spread %.2f keep %s", hand.id, rmax - rmin, best->cam->name.c_str());
+                return hand_3d(hand, {best}, t_ns);
+            }
+        }
         const int n = int(views.size());
         std::vector<V3> origins(n), dirs(n);
         std::vector<double> w(n), res(21);
@@ -737,6 +756,11 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
         else
             h.fit.valid = false;
     }
+    // Sustained unreadable occlusion past coast_max: drop from published output cleanly instead
+    // of leaving a stale ghost hand.
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const Hand *p) { return p->fit.valid && p->fit.coast_expired; }),
+              out.end());
     // views split off by a failed triangulation start over as new hands next frame, unless they
     // were this hand misread (-2, the misread guard: dropped)
     const size_t before = views_.size();

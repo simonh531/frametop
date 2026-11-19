@@ -85,7 +85,7 @@ void Pinch::update(const std::vector<const Hand *> &hands, const std::vector<See
         }
         world_d[s] = tri_d[s] = fit_d[s] = palm_down[s] = other_d[s] = -1;
         for (double &c : curl[s]) c = -1;
-        if (!h) {
+        if (!h || (h->fit.valid && h->fit.coasting)) {
             o.flags &= ~FH_PINCH_TRACKED;
             if (down && (t_ns - seen_ns_[s]) / 1e9 > p_.grace_s) end(s, t_ns, true);
             continue;
@@ -293,7 +293,7 @@ void Grip::update(const std::vector<const Hand *> &hands, const std::vector<Seen
         }
         curl[s] = -1;
         double f[4], thumb = 1;
-        if (!h || !curls(*h, views, f, &thumb)) {
+        if (!h || (h->fit.valid && h->fit.coasting) || !curls(*h, views, f, &thumb)) {
             o.flags &= ~FH_PINCH_TRACKED;
             if (down && (t_ns - seen_ns_[s]) / 1e9 > p_.grace_s) end(s, t_ns, true);
             continue;

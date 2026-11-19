@@ -300,6 +300,7 @@ int main(int argc, char **argv) {
     // the skeleton fit (track/skeleton.h): published as fh_hands version 2, and as version 1's
     // points and capsules; 0 publishes the One Euro filtered landmarks as before, and no skeleton
     bool skeleton = setting("HANDS_SKELETON") != "0";
+    bool coast = setting("HANDS_COAST") != "0";   // rollback-style coasting on freak-out frames
     PinchParams pinch_params;
     pinch_params.dip = setting("HANDS_PINCH_DIP") == "1";
     setting_number("HANDS_PINCH_FIST_CURL", pinch_params.fist_curl);
@@ -356,6 +357,7 @@ int main(int argc, char **argv) {
         else if (a == "--pair-sides" && more) pair_sides = std::string(argv[++i]) == "1";
         else if (a == "--hold" && more) hold = std::atof(argv[++i]);
         else if (a == "--skeleton" && more) skeleton = std::string(argv[++i]) != "0";
+        else if (a == "--coast" && more) coast = std::string(argv[++i]) != "0";
         else if (a == "--flag-buffer" && more) flag_on = std::string(argv[++i]) != "0";
         else if (a == "--cams" && more) cams_arg = argv[++i];
         else if (a == "--bright" && more) bright_arg = argv[++i];
@@ -380,6 +382,7 @@ int main(int argc, char **argv) {
                         "          [--misread-guard 0|1] (0; 1 for fine-tuned landmark models: see Tracker::set_misread_guard)\n"
                         "          [--reacquire S] (1.5; 0: off: see Tracker::set_reacquire) [--pair-sides 0|1] (1) [--hold S] (0.6)\n"
                         "          [--skeleton 0|1] (1: fit a skeleton with the user's bone lengths and publish it; HANDS_SKELETON)\n"
+                        "          [--coast 0|1] (1: coast/freeze orientation on freak-out frames and gate gestures; HANDS_COAST)\n"
                         "          [--flag-buffer 0|1] (1: keep the last seconds for `ft-handsctl flag`; HANDS_FLAG_BUFFER)\n"
                         "          [--cams auto|mono|color|all] (auto) [--bright all|color] (all) [--bright-on L] (40) [--bright-off L] (25)\n"
                         "          [--color-left color_video0|color_video3] [--color-crop subtract|none]\n"
@@ -624,6 +627,11 @@ int main(int argc, char **argv) {
     tracker.set_pair_sides(pair_sides);
     tracker.set_hold(reacquire > 0 ? hold : 0.3);
     tracker.set_skeleton(skeleton);
+    {
+        skel::Params sp = tracker.skeleton().params();
+        sp.coast = coast ? 1.0 : 0.0;
+        tracker.skeleton().set_params(sp);
+    }
     std::map<std::string, std::vector<uint8_t>> pixels;
     // A mono set is the side pair's newer frames (all the mono cameras' without both sides) with
     // the upper pair's from the same moment. XRService keeps the uppers in step with the sides,

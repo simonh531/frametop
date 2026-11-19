@@ -88,6 +88,14 @@ struct Fit {
     double len[20]{};         // bone lengths used
     V3 elbow{};
     double settled = 0;       // the side's calibration, 0..1
+    // freak-out coasting state (when Params::coast > 0)
+    bool coasting = false;        // this frame coasted instead of trusting the raw measurement
+    bool coast_expired = false;   // sustained coasting exceeded Params::coast_max
+    int64_t tracked_ns = 0;       // capture time of the last clean measured frame
+    double coast_s = 0;           // continuous coast duration, s
+    int relock_n = 0;             // consecutive self-consistent candidate frames while coasting
+    V3 relock_c{};                // last candidate palm centre for re-lock consistency
+    Rot relock_R;                 // last candidate palm rotation for re-lock consistency
 };
 
 struct Params {
@@ -102,6 +110,15 @@ struct Params {
     double depth_ratio = 3.5;                // stereo: how much less sure depth is than across the view
     double limits = 1;                       // scales the joint limits (for tests: 10 is about none)
     double forearm_ratio = 2.8;              // forearm / palm length (notes/forearm.md)
+    // rollback-style coasting on freak-out frames (0: off, 1: on)
+    double coast = 0;
+    double coast_rms = 0.070;                // m: fit rms above this triggers coasting
+    double coast_jump = 0.095;               // m: single-step palm jump above this triggers coasting
+    double coast_rot = 1.15;                 // rad (~66 deg): single-step palm rotation above this triggers coasting
+    double coast_tau = 0.09;                 // s: exponential velocity decay while coasting position
+    double coast_max = 0.50;                 // s: max sustained coast before flagging coast_expired
+    double relax_tau = 0.35;                 // s: low-trust finger relaxation toward neutral rest pose
+    int relock_frames = 2;                   // consecutive self-consistent frames to re-lock after coast
 };
 
 class Skeleton {

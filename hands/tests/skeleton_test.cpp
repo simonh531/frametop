@@ -192,6 +192,65 @@ int main() {
         CHECK(e[1] < wrist[1] && e[2] > wrist[2]);
     }
 
+    // freak-out coasting: teleport/flip triggers coast with frozen orientation and decayed
+    // position velocity, 2-frame clean re-lock exits coast, sustained bad geometry expires
+    {
+        constexpr double D = M_PI / 180;
+        Params p;
+        p.coast = 1;
+        p.coast_max = 0.20;
+        p.relock_frames = 2;
+        Skeleton sk(p);
+        const Shape truth = Skeleton::canonical(1.0);
+        double q[kParams] = {};
+        q[7] = 60 * D;   // curled index MCP so we can verify neutral relaxation
+        Fit f;
+        int64_t ns = 1'000'000'000;
+        const Rot R0 = exp_rot({0.1, -0.1, 0.05});
+        // 5 clean moving frames (+x at 0.3 m/s)
+        for (int i = 0; i < 5; ++i) {
+            ns += 50'000'000;
+            V3 pts[21];
+            Rot fr[21];
+            Skeleton::pose(truth, 1, R0, {0.05 + 0.015 * i, -0.1, -0.4}, q, pts, fr);
+            sk.update(f, pts, true, 0.95, 2, 0.002, nullptr, {0, 0, 0}, 1.0, ns);
+            CHECK(f.valid && !f.coasting && !f.coast_expired);
+        }
+        const V3 cf_before = f.cf;
+        const Rot Rf_before = f.Rf;
+        const double q7_before = f.qf[7];
+        const int64_t tracked_before = f.tracked_ns;
+
+        // 1 corrupted frame: 25 cm teleport + 150 deg flip
+        ns += 50'000'000;
+        V3 bad_pts[21];
+        Rot fr[21];
+        Skeleton::pose(truth, 1, exp_rot({0, 2.6, 0}), {0.40, -0.1, -0.4}, q, bad_pts, fr);
+        sk.update(f, bad_pts, true, 0.95, 2, 0.002, nullptr, {0, 0, 0}, 1.0, ns);
+        CHECK(f.valid && f.coasting && !f.coast_expired);
+        CHECK(f.tracked_ns == tracked_before);
+        // orientation stayed frozen, palm moved smoothly forward (+x) instead of teleporting +35 cm
+        CHECK(norm(log_rot(Rf_before.t() * f.Rf)) < 1e-6);
+        CHECK(f.cf[0] > cf_before[0] && norm(f.cf - cf_before) < 0.03);
+        // curled index relaxed slightly toward neutral (0.26 rad < 60 deg)
+        CHECK(f.qf[7] < q7_before);
+
+        // 2nd consecutive clean frame at the new pose -> re-locks cleanly
+        ns += 50'000'000;
+        sk.update(f, bad_pts, true, 0.95, 2, 0.002, nullptr, {0, 0, 0}, 1.0, ns);
+        CHECK(f.valid && !f.coasting && !f.coast_expired);
+
+        // sustained bone-exploded geometry past coast_max (0.20 s) -> coast_expired
+        V3 exploded[21];
+        for (int i = 0; i < 21; ++i) exploded[i] = bad_pts[i] * 5.0;
+        for (int i = 0; i < 6; ++i) {
+            ns += 50'000'000;
+            sk.update(f, exploded, true, 0.95, 2, 0.002, nullptr, {0, 0, 0}, 1.0, ns);
+        }
+        CHECK(f.coasting && f.coast_expired);
+        std::printf("coasting: freeze-rot, pos-coast, neutral-relax, 2-frame relock, and max-coast expire ok\n");
+    }
+
     std::printf(failures ? "%d FAILED\n" : "skeleton tests passed\n", failures);
     return failures ? 1 : 0;
 }

@@ -157,7 +157,9 @@ void Publisher::fill_fit(const Hand &h, uint64_t capture_ns, fh_hand_fit_t &o) {
     };
     o.flags = FH_FIT_VALID | FH_FIT_ELBOW_HEAD_UP | (f.side > 0 ? FH_FIT_RIGHT : 0) | (f.settled >= 1 ? FH_FIT_SETTLED : 0) |
               (f.flipped ? FH_FIT_FLIPPED : 0);
-    o.tracked_ns = capture_ns;
+    o.tracked_ns = (f.coasting && f.tracked_ns > 0 && f.ns >= f.tracked_ns && capture_ns >= uint64_t(f.ns - f.tracked_ns))
+                       ? capture_ns - uint64_t(f.ns - f.tracked_ns)
+                       : capture_ns;
     for (int i = 0; i < 21; ++i) {
         put(o.joints[i].p, f.pts[i]);
         o.joints[i].radius = float(f.radius[i]);
