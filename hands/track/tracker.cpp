@@ -43,10 +43,8 @@ V2 palm_centre(const Landmarks &lm) { return lm.pts[9]; }
 
 // Two views in one camera on the same hand: the landmark model puts the same points on
 // it from both crops, even when the crops differ.
-bool same_hand(const Landmarks &a, const Landmarks &b, double size) {
-    double d = 0;
-    for (int i = 0; i < 21; ++i) d += norm(a.pts[i] - b.pts[i]) / 21;
-    return norm(palm_centre(a) - palm_centre(b)) < 0.5 * size || d < 0.25 * size;
+bool same_hand(const Landmarks &a, const Landmarks &b, double size, const OverlapParams &p) {
+    return views_are_duplicate(a.pts, a.right, b.pts, b.right, size, p);
 }
 
 double hand_size(const Landmarks &lm) {
@@ -443,9 +441,15 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
             if (v.hand == id) have.insert(v.cam->name);
         if (int(have.size()) >= max_views_) continue;
         std::vector<std::pair<double, View>> options;
-        // a hand missed last step (held): look where it was heading, not where it was
-        const V3 ahead = reacquire_s_ > 0 && hand.seen_ns < last_ns_ ? hand.dpalm * std::min((t_ns - hand.seen_ns) / 1e9, 0.15)
-                                                                      : V3{0, 0, 0};
+        // a hand missed last step (held) or moving fast: look where it's heading, not where it was
+        V3 ahead{0, 0, 0};
+        if (t_ns > hand.seen_ns) {
+            const double dt = (t_ns - hand.seen_ns) / 1e9;
+            if (reacquire_s_ > 0 && hand.seen_ns < last_ns_)
+                ahead = hand.dpalm * std::min(dt, 0.15);
+            else if (roi_predict_.gain > 0 && hand.frames >= 2 && norm(hand.dpalm) >= roi_predict_.min_speed)
+                ahead = hand.dpalm * (std::min(dt, roi_predict_.max_dt) * roi_predict_.gain);
+        }
         for (auto &[name, cam] : cams_) {
             if (have.count(name) || !images.count(name)) continue;
             V2 uv[21];
@@ -479,6 +483,32 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
     if (int(chosen.size()) > hand_budget_) {
         for (size_t k = hand_budget_; k < chosen.size(); ++k) note("over-budget %d %s", chosen[k]->hand, chosen[k]->cam->name.c_str());
         chosen.resize(hand_budget_);
+    }
+    if (roi_predict_.gain > 0) {
+        for (View *v : chosen) {
+            if (v->frames <= 0) continue;   // hand-over views already projected ahead in step 1
+            const auto it = hands_.find(v->hand);
+            if (it == hands_.end()) continue;
+            const Hand &h = it->second;
+            if (!h.has_pts || h.frames < 2 || t_ns <= h.seen_ns) continue;
+            const V3 palm = (h.pts[0] + h.pts[5] + h.pts[9] + h.pts[13] + h.pts[17]) * 0.2;
+            v->roi = predict_roi(*v->cam, v->roi, palm, h.dpalm, (t_ns - h.seen_ns) / 1e9, roi_predict_);
+        }
+    }
+    if (overlap_.nudge > 0 || overlap_.tighten > 0) {
+        for (View *v : chosen) {
+            V2 closest{};
+            double best_d = 1e9;
+            for (const auto &[oid, oh] : hands_) {
+                if (oid == v->hand || !oh.has_pts || oh.frames < 2) continue;
+                double z = 0;
+                const V2 uv = v->cam->project(oh.pts[9], &z);
+                if (z <= 0.05) continue;
+                const double d = norm(v->roi.center - uv);
+                if (d < best_d) best_d = d, closest = uv;
+            }
+            if (best_d < 1e9) v->roi = nudge_roi_away(*v->cam, v->roi, closest, overlap_);
+        }
     }
     run_landmarks(images, chosen);
     const bool blinding = blind_until_ > t_ns;
@@ -517,7 +547,7 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
     for (View *v : kept) {
         const double size = hand_size(v->lm);
         bool dup = false;
-        for (View &o : next) dup = dup || (o.cam == v->cam && same_hand(o.lm, v->lm, size));
+        for (View &o : next) dup = dup || (o.cam == v->cam && same_hand(o.lm, v->lm, size, overlap_));
         if (!dup) next.push_back(*v);
         else ++stats.dups, note("dup %d %s", v->hand, v->cam->name.c_str());
     }
@@ -531,20 +561,34 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
     // unless a tracked hand is already there
     std::vector<Lost> targets;
     if (reacquire_s_ > 0) {
-        std::vector<V3> at;
+        struct TrackedAt {
+            V3 palm;
+            double right_score;
+            bool established;
+        };
+        std::vector<TrackedAt> at;
         for (auto &[id, h] : hands_)
-            if (tracked.count(id) && h.has_pts) at.push_back(h.pts[9]);
-        auto taken = [&](V3 p) {
-            for (const V3 &q : at)
-                if (norm(p - q) < reacquire_clear_) return true;
+            if (tracked.count(id) && h.has_pts) at.push_back({h.pts[9], h.right_score, h.frames >= 5});
+        auto taken = [&](V3 p, double right_score, bool established) {
+            for (const TrackedAt &q : at) {
+                const double clear =
+                    (established && q.established && sides_conflict(right_score, q.right_score, overlap_))
+                        ? overlap_.opp_clear_m
+                        : reacquire_clear_;
+                if (norm(p - q.palm) < clear) return true;
+            }
             return false;
         };
         lost_.erase(std::remove_if(lost_.begin(), lost_.end(),
-                                   [&](const Lost &l) { return (t_ns - l.t_ns) / 1e9 > reacquire_s_ || taken(l.palm); }),
+                                   [&](const Lost &l) {
+                                       return (t_ns - l.t_ns) / 1e9 > reacquire_s_ ||
+                                              taken(l.palm, l.right_score, l.established);
+                                   }),
                     lost_.end());
         for (auto &[id, h] : hands_)
-            if (!tracked.count(id) && h.has_pts && h.frames >= 3 && !taken(h.pts[9]))
-                targets.push_back({id, (h.pts[0] + h.pts[5] + h.pts[9] + h.pts[13] + h.pts[17]) * 0.2, h.dpalm, h.seen_ns});
+            if (!tracked.count(id) && h.has_pts && h.frames >= 3 && !taken(h.pts[9], h.right_score, h.frames >= 5))
+                targets.push_back({id, (h.pts[0] + h.pts[5] + h.pts[9] + h.pts[13] + h.pts[17]) * 0.2, h.dpalm,
+                                   h.seen_ns, h.right_score, h.frames >= 5});
         for (const Lost &l : lost_) targets.push_back(l);
         std::sort(targets.begin(), targets.end(), [](const Lost &a, const Lost &b) { return a.t_ns > b.t_ns; });
     }
@@ -675,6 +719,7 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
         double dist = 0.12;
         for (auto &[id, h] : hands_) {
             if (!h.has_pts) continue;
+            if (h.frames >= 5 && sides_conflict(v.lm.right, h.right_score, overlap_)) continue;
             bool same_cam = false;
             for (View &o : views_) same_cam = same_cam || (o.hand == id && o.cam == v.cam);
             if (same_cam) continue;
@@ -714,7 +759,8 @@ std::vector<const Hand *> Tracker::step(const std::map<std::string, Image> &imag
         } else if (t_ns - h.seen_ns > (h.frames >= 30 ? int64_t(hold_s_ * 1e9) : 300'000'000)) {
             note("forget %d after %d frames", h.id, h.frames);
             if (reacquire_s_ > 0 && h.has_pts && h.frames >= 3)
-                lost_.push_back({h.id, (h.pts[0] + h.pts[5] + h.pts[9] + h.pts[13] + h.pts[17]) * 0.2, h.dpalm, h.seen_ns});
+                lost_.push_back({h.id, (h.pts[0] + h.pts[5] + h.pts[9] + h.pts[13] + h.pts[17]) * 0.2, h.dpalm,
+                                 h.seen_ns, h.right_score, h.frames >= 5});
             it = hands_.erase(it);
             ++stats.forgotten;
         } else {

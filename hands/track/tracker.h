@@ -4,6 +4,8 @@
 
 #include "calib.h"
 #include "nets.h"
+#include "overlap.h"
+#include "roi_predict.h"
 #include "skeleton.h"
 
 #include <condition_variable>
@@ -142,6 +144,18 @@ public:
     // The skeleton fit (track/skeleton.h), after each hand's 3D. On by default.
     void set_skeleton(bool on) { skeleton_on_ = on; }
     skel::Skeleton &skeleton() { return skel_; }
+    // Velocity-predicted active ROI crops (track/roi_predict.h): shift each tracked view's
+    // next landmark crop by gain * vel * dt so fast-moving hands don't outrun their crop.
+    // gain 0: off (as before).
+    void set_roi_predict(double gain) { roi_predict_.gain = std::clamp(gain, 0.0, 1.0); }
+    // Two-hand overlap resilience (track/overlap.h): handedness-aware duplicate/join/re-acquire
+    // guards and optional crop nudging/tightening away from the other hand.
+    void set_overlap(const OverlapParams &p) { overlap_ = p; }
+    void set_overlap_guard(bool on) { overlap_.guard = on; }
+    void set_crop_nudge(double nudge, double tighten = 0.0) {
+        overlap_.nudge = std::clamp(nudge, 0.0, 0.35);
+        overlap_.tighten = std::clamp(tighten, 0.0, 0.35);
+    }
     // One view's 3D hand: each landmark along its ray, as far as how big the palm looks says
     // for a hand `scale` times the model's (Hand::scale). False if the palm is degenerate.
     static bool single_view(const Camera &cam, const Landmarks &lm, double scale, V3 out[21]);
@@ -179,6 +193,8 @@ private:
         int id;
         V3 palm, vel;
         int64_t t_ns;
+        double right_score = 0.5;
+        bool established = false;
     };
     std::vector<Lost> lost_;
     bool pair_sides_ = false;
@@ -190,6 +206,8 @@ private:
     double reacquire_s_ = 0, reacquire_clear_ = 0.12;   // a lost hand this near a tracked one isn't aimed at
     int reacquire_tiles_ = 2;
     bool reacquire_fast_ = false;
+    RoiPredictParams roi_predict_;
+    OverlapParams overlap_;
 
     std::map<std::string, const Camera *> cams_;
     const Nets &nets_;

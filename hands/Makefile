@@ -52,12 +52,22 @@ build/flagbuf-test: tests/flagbuf_test.cpp $(TRACK) $(HDR) $(NCNN)/lib/libncnn.a
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ tests/flagbuf_test.cpp $(TRACK) $(LDLIBS)
 
-check: build/sides-test build/skeleton-test build/pinch-test build/flagbuf-test build/calibfile-test
+check: build/sides-test build/skeleton-test build/pinch-test build/flagbuf-test build/calibfile-test build/roi-predict-test build/overlap-test
 	build/sides-test
 	build/skeleton-test
 	build/pinch-test
 	build/flagbuf-test
 	build/calibfile-test
+	build/roi-predict-test
+	build/overlap-test
+
+build/roi-predict-test: tests/roi_predict_test.cpp track/roi_predict.h track/geom.h
+	@mkdir -p build
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -o $@ tests/roi_predict_test.cpp
+
+build/overlap-test: tests/overlap_test.cpp track/overlap.h track/geom.h
+	@mkdir -p build
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -o $@ tests/overlap_test.cpp
 
 build/calibfile-test: tests/calibfile_test.cpp track/calibfile.cpp track/calibfile.h track/calib.h include/fh_calib.h include/fh_shm.hpp
 	@mkdir -p build
@@ -80,6 +90,6 @@ build/ncnn/install/lib/libncnn.a:
 	cmake --build build/ncnn/build --target install > build/ncnn/build.log
 
 clean:
-	rm -f build/ft-camd build/ft-hands build/ft-handreplay build/ft-ringplay build/sides-test build/skeleton-test build/pinch-test build/flagbuf-test
+	rm -f build/ft-camd build/ft-hands build/ft-handreplay build/ft-ringplay build/sides-test build/skeleton-test build/pinch-test build/flagbuf-test build/roi-predict-test build/overlap-test
 
 .PHONY: all tools check clean

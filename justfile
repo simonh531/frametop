@@ -342,6 +342,10 @@ test-c:
     g++ -std=c++17 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-psabi hands/tests/skeleton_test.cpp \
       hands/track/skeleton.cpp -o build/tests/skeleton-test
     run hands/tests/skeleton_test.cpp build/tests/skeleton-test
+    g++ -std=c++17 -O2 -Wall -Wextra -Werror hands/tests/roi_predict_test.cpp -o build/tests/roi-predict-test
+    run hands/tests/roi_predict_test.cpp build/tests/roi-predict-test
+    g++ -std=c++17 -O2 -Wall -Wextra -Werror hands/tests/overlap_test.cpp -o build/tests/overlap-test
+    run hands/tests/overlap_test.cpp build/tests/overlap-test
     g++ -std=c++17 -O2 -Wall -Wextra -Werror hands/tests/shm_test.cpp -o build/tests/shm-test
     run hands/tests/shm_test.cpp build/tests/shm-test
     g++ -std=c++17 -O2 -Wall -Wextra -Werror -Wno-unused-parameter hands/tests/calibfile_test.cpp hands/track/calibfile.cpp \

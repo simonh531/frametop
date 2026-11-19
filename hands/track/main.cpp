@@ -297,6 +297,12 @@ int main(int argc, char **argv) {
     setting_number("HANDS_REACQUIRE", reacquire);
     bool pair_sides = setting("HANDS_PAIR_SIDES") != "0";
     double hold = 0.6;   // s a lost, established hand is kept and retried before it's forgotten
+    double roi_predict = 0.7;   // active ROI velocity lead gain (0: off; track/roi_predict.h)
+    setting_number("HANDS_ROI_PREDICT", roi_predict);
+    bool overlap_guard = setting("HANDS_OVERLAP_GUARD") != "0";
+    double crop_nudge = 0.15, crop_tighten = 0.08;
+    setting_number("HANDS_CROP_NUDGE", crop_nudge);
+    setting_number("HANDS_CROP_TIGHTEN", crop_tighten);
     // the skeleton fit (track/skeleton.h): published as fh_hands version 2, and as version 1's
     // points and capsules; 0 publishes the One Euro filtered landmarks as before, and no skeleton
     bool skeleton = setting("HANDS_SKELETON") != "0";
@@ -355,6 +361,10 @@ int main(int argc, char **argv) {
         else if (a == "--reacquire" && more) reacquire = std::atof(argv[++i]);
         else if (a == "--pair-sides" && more) pair_sides = std::string(argv[++i]) == "1";
         else if (a == "--hold" && more) hold = std::atof(argv[++i]);
+        else if (a == "--roi-predict" && more) roi_predict = std::atof(argv[++i]);
+        else if (a == "--overlap-guard" && more) overlap_guard = std::string(argv[++i]) == "1";
+        else if (a == "--crop-nudge" && more) crop_nudge = std::atof(argv[++i]);
+        else if (a == "--crop-tighten" && more) crop_tighten = std::atof(argv[++i]);
         else if (a == "--skeleton" && more) skeleton = std::string(argv[++i]) != "0";
         else if (a == "--flag-buffer" && more) flag_on = std::string(argv[++i]) != "0";
         else if (a == "--cams" && more) cams_arg = argv[++i];
@@ -379,6 +389,9 @@ int main(int argc, char **argv) {
                         "          [--keep-presence P] (0.5) [--ring PATH] (ft-camd's, or ft-ringplay's)\n"
                         "          [--misread-guard 0|1] (0; 1 for fine-tuned landmark models: see Tracker::set_misread_guard)\n"
                         "          [--reacquire S] (1.5; 0: off: see Tracker::set_reacquire) [--pair-sides 0|1] (1) [--hold S] (0.6)\n"
+                        "          [--roi-predict G] (0.7; 0: off: velocity-predicted active ROI crops; HANDS_ROI_PREDICT)\n"
+                        "          [--overlap-guard 0|1] (1: handedness-aware duplicate/join/re-acquire; HANDS_OVERLAP_GUARD)\n"
+                        "          [--crop-nudge F] (0.15) [--crop-tighten F] (0.08: nudge/tighten crop away from other hand)\n"
                         "          [--skeleton 0|1] (1: fit a skeleton with the user's bone lengths and publish it; HANDS_SKELETON)\n"
                         "          [--flag-buffer 0|1] (1: keep the last seconds for `ft-handsctl flag`; HANDS_FLAG_BUFFER)\n"
                         "          [--cams auto|mono|color|all] (auto) [--bright all|color] (all) [--bright-on L] (40) [--bright-off L] (25)\n"
@@ -623,6 +636,9 @@ int main(int argc, char **argv) {
     tracker.set_reacquire(reacquire, 2, true);
     tracker.set_pair_sides(pair_sides);
     tracker.set_hold(reacquire > 0 ? hold : 0.3);
+    tracker.set_roi_predict(roi_predict);
+    tracker.set_overlap_guard(overlap_guard);
+    tracker.set_crop_nudge(crop_nudge, crop_tighten);
     tracker.set_skeleton(skeleton);
     std::map<std::string, std::vector<uint8_t>> pixels;
     // A mono set is the side pair's newer frames (all the mono cameras' without both sides) with

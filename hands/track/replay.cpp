@@ -161,7 +161,9 @@ int main(int argc, char **argv) {
     bool reacquire_fast = false, pair_sides = false;
     double drop_every = 0;   // seconds; 0: off
     double reacquire_clear = 0.12;
-    double near_frac = 0.5, hold = 0.3;
+    double near_frac = 0.5, hold = 0.3, roi_predict = 0.0;
+    bool overlap_guard = false;
+    double crop_nudge = 0.0, crop_tighten = 0.0;
     int search_budget1 = 2;
     bool skeleton = true, pinch_fitted = false;
     skel::Params skel_params;
@@ -209,6 +211,10 @@ int main(int argc, char **argv) {
         else if (a == "--drop-every" && more) drop_every = std::atof(argv[++i]);
         else if (a == "--near" && more) near_frac = std::atof(argv[++i]);
         else if (a == "--hold" && more) hold = std::atof(argv[++i]);
+        else if (a == "--roi-predict" && more) roi_predict = std::atof(argv[++i]);
+        else if (a == "--overlap-guard") overlap_guard = true;
+        else if (a == "--crop-nudge" && more) crop_nudge = std::atof(argv[++i]);
+        else if (a == "--crop-tighten" && more) crop_tighten = std::atof(argv[++i]);
         else if (a == "--search-budget" && more) search_budget1 = std::atoi(argv[++i]);
         else if (a == "--no-skeleton") skeleton = false;
         else if (a == "--pinch-fitted") pinch_fitted = true;
@@ -335,6 +341,9 @@ int main(int argc, char **argv) {
     tracker.set_pair_sides(pair_sides);
     tracker.set_near(near_frac);
     tracker.set_hold(hold);
+    tracker.set_roi_predict(roi_predict);
+    tracker.set_overlap_guard(overlap_guard);
+    tracker.set_crop_nudge(crop_nudge, crop_tighten);
     tracker.set_search_budget(3, search_budget1);
     std::vector<std::string> trace;
     if (tl) {
